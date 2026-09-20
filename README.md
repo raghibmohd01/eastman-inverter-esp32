@@ -49,4 +49,4 @@ This project reads real-time telemetry data from an **Eastman Smart Max 6100 Inv
    ```
 
 4. **Verify:**
-   Open the Serial Monitor at `115200` baud to see the decoded frames, or visit the IP address printed in the console (e.g. `http://192.168.1.100/telemetry`).
+   Open the Serial Monitor at `115200` baud to see the decoded frames, or visit the IP address printed in the console (e.g. `http://<ESP_IP_ADDRESS>/telemetry`).
