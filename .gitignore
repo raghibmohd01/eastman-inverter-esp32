@@ -1,0 +1,15 @@
+# PlatformIO Build Directories
+.pio/
+.vscode/
+
+# Python Virtual Environments
+.venv/
+venv/
+env/
+
+# Hidden Credentials
+include/secrets.h
+
+# OS Generated
+.DS_Store
+*.swp
