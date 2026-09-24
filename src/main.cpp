@@ -2,6 +2,13 @@
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
 #include <WiFi.h>
+#include <time.h>
+#include <ArduinoOTA.h>
+#include <TelnetStream.h>
+
+#define LOG_PRINT(x) { Serial.print(x); TelnetStream.print(x); }
+#define LOG_PRINTLN(x) { Serial.println(x); TelnetStream.println(x); }
+#define LOG_PRINTF(fmt, ...) { Serial.printf(fmt, ##__VA_ARGS__); TelnetStream.printf(fmt, ##__VA_ARGS__); }
 
 #include "secrets.h"
 
@@ -51,6 +58,11 @@ IPAddress subnet(255, 255, 255, 0);
 IPAddress primaryDNS(8, 8, 8, 8);
 IPAddress secondaryDNS(8, 8, 4, 4);
 
+// NTP Configuration
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 19800; // +05:30
+const int   daylightOffset_sec = 0;
+
 void handleTelemetry(AsyncWebServerRequest *request) {
   lastActivityTime = millis(); // Feed the watchdog
 
@@ -79,6 +91,12 @@ void handleTelemetry(AsyncWebServerRequest *request) {
   serializeJson(doc, *response);
   request->send(response);
 }
+
+// History Averaging Accumulators
+float sumPvPower = 0;
+float sumLoadPercentage = 0;
+float sumBatteryVoltage = 0;
+int historySampleCount = 0;
 
 void parseEastmanFrame() {
   // According to official Eastman Solar Smart Max 6100 specification:
@@ -124,32 +142,29 @@ void parseEastmanFrame() {
   telemetry.rawHex = hexDump;
   lastActivityTime = millis(); // Feed watchdog on successful frame
 
-  // Flash onboard blue LED to show successful telemetry frame reception once
-  // every 1 minute
-  static unsigned long lastFlash = 0;
-  if (millis() - lastFlash > 60000) {
-    lastFlash = millis();
-    digitalWrite(LED_PIN, HIGH);
-    delay(50);
-    digitalWrite(LED_PIN, LOW);
-  }
+  sumPvPower += telemetry.pvPower;
+  sumLoadPercentage += telemetry.loadPercentage;
+  sumBatteryVoltage += telemetry.batteryVoltage;
+  historySampleCount++;
 
-  Serial.println(
+
+
+  LOG_PRINTLN(
       "\n============================================================");
-  Serial.println("  🎉🎉🎉 VALID EASTMAN SMART MAX 6100 FRAME DECODED! 🎉🎉🎉");
-  Serial.println(
+  LOG_PRINTLN("  🎉🎉🎉 VALID EASTMAN SMART MAX 6100 FRAME DECODED! 🎉🎉🎉");
+  LOG_PRINTLN(
       "============================================================");
-  Serial.printf("  Battery:     %.2f V | %.1f A\n", telemetry.batteryVoltage,
+  LOG_PRINTF("  Battery:     %.2f V | %.1f A\n", telemetry.batteryVoltage,
                 telemetry.batteryCurrent);
-  Serial.printf("  Solar PV:    %.1f V | %.1f A | %.0f W\n",
+  LOG_PRINTF("  Solar PV:    %.1f V | %.1f A | %.0f W\n",
                 telemetry.pvVoltage, telemetry.pvCurrent, telemetry.pvPower);
-  Serial.printf("  Grid Input:  %.1f V | %.1f Hz\n", telemetry.acInputVoltage,
+  LOG_PRINTF("  Grid Input:  %.1f V | %.1f Hz\n", telemetry.acInputVoltage,
                 telemetry.acInputFrequency);
-  Serial.printf("  AC Output:   %.1f V | %.1f Hz\n", telemetry.acOutputVoltage,
+  LOG_PRINTF("  AC Output:   %.1f V | %.1f Hz\n", telemetry.acOutputVoltage,
                 telemetry.acOutputFrequency);
-  Serial.printf("  Load:        %.0f %%\n", telemetry.loadPercentage);
-  Serial.printf("  Raw Frame:   %s\n", hexDump.c_str());
-  Serial.println(
+  LOG_PRINTF("  Load:        %.0f %%\n", telemetry.loadPercentage);
+  LOG_PRINTF("  Raw Frame:   %s\n", hexDump.c_str());
+  LOG_PRINTLN(
       "============================================================\n");
 }
 
@@ -182,6 +197,22 @@ void setup() {
   Serial.print("IP Address: http://");
   Serial.println(WiFi.localIP());
 
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  // OTA Setup
+  ArduinoOTA.setHostname("eastman-inverter");
+  ArduinoOTA.onStart([]() { Serial.println("\n[OTA] Start updating"); });
+  ArduinoOTA.onEnd([]() { Serial.println("\n[OTA] End"); });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("[OTA] Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("[OTA] Error[%u]: ", error);
+  });
+  ArduinoOTA.begin();
+  TelnetStream.begin();
+  Serial.println("OTA & Telnet Ready");
+
   // Firebase Setup
   config.api_key = FIREBASE_API_KEY;
   config.database_url = FIREBASE_DATABASE_URL;
@@ -199,10 +230,24 @@ void setup() {
 }
 
 void loop() {
+  ArduinoOTA.handle();
+
   if (millis() - lastActivityTime > WATCHDOG_TIMEOUT_MS) {
-    Serial.println("\n[WATCHDOG] No activity for 5 minutes. Restarting...");
+    LOG_PRINTLN("\n[WATCHDOG] No activity for 5 minutes. Restarting...");
     delay(1000);
     ESP.restart();
+  }
+
+  // Blink blue LED every 30 seconds if all systems are nominal (WiFi, Firebase, and Inverter data)
+  static unsigned long lastBlinkTime = 0;
+  if (millis() - lastBlinkTime > 30000) {
+    lastBlinkTime = millis();
+    bool isFresh = (millis() - telemetry.lastUpdateTime) < 5000;
+    if (isFresh && WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(50);
+      digitalWrite(LED_PIN, LOW);
+    }
   }
 
   // server.handleClient(); is not needed for AsyncWebServer
@@ -229,9 +274,58 @@ void loop() {
     json.set("data/lastUpdateMs", millis() - telemetry.lastUpdateTime);
 
     if (Firebase.RTDB.setJSON(&fbdo, "/telemetry/live", &json)) {
-      Serial.println("[Firebase] Push successful");
+      LOG_PRINTLN("[Firebase] Push successful");
     } else {
-      Serial.printf("[Firebase] Push failed: %s\n", fbdo.errorReason().c_str());
+      LOG_PRINTF("[Firebase] Push failed: %s\n", fbdo.errorReason().c_str());
+    }
+  }
+
+  // --- Historical Data Logging (30-day circular buffer) ---
+  static unsigned long lastHistoryUpdate = 0;
+  if (Firebase.ready() && (millis() - lastHistoryUpdate > 300000 || lastHistoryUpdate == 0)) {
+    // Only attempt to push if we have fresh telemetry data
+    if (millis() - telemetry.lastUpdateTime < 10000) {
+      struct tm timeinfo;
+      if (getLocalTime(&timeinfo, 10)) { // Don't block for long
+        lastHistoryUpdate = millis();
+        int timeSlot = (timeinfo.tm_hour * 60 + timeinfo.tm_min) / 5;
+        int dayOfMonth = timeinfo.tm_mday;
+        
+        time_t now;
+        time(&now);
+
+        float avgPvPower = (historySampleCount > 0) ? (sumPvPower / historySampleCount) : 0;
+        float avgLoad = (historySampleCount > 0) ? (sumLoadPercentage / historySampleCount) : 0;
+        float avgBattV = (historySampleCount > 0) ? (sumBatteryVoltage / historySampleCount) : 0;
+
+        FirebaseJson historyJson;
+        historyJson.set("batteryVoltage", avgBattV);
+        historyJson.set("loadPercentage", avgLoad);
+        historyJson.set("pvPower", avgPvPower);
+        historyJson.set("pvEnergy", telemetry.pvEnergy); // Cumulative counter, use snapshot
+        historyJson.set("timestamp", (long)now);
+
+        // Reset accumulators for the next 5 min window
+        sumPvPower = 0;
+        sumLoadPercentage = 0;
+        sumBatteryVoltage = 0;
+        historySampleCount = 0;
+
+        char path[64];
+        snprintf(path, sizeof(path), "/telemetry/history/day_%d/slot_%d", dayOfMonth, timeSlot);
+
+        if (Firebase.RTDB.setJSON(&fbdo, path, &historyJson)) {
+          LOG_PRINTF("[History] Successfully pushed to %s\n", path);
+        } else {
+          LOG_PRINTF("[History] Failed to push to %s: %s\n", path, fbdo.errorReason().c_str());
+        }
+      }
+    } else if (lastHistoryUpdate == 0) {
+      // If we don't have fresh data yet, don't set lastHistoryUpdate so we can try again soon
+    } else {
+      // We have no fresh data, but we already successfully ran before. We'll wait another 5 mins.
+      lastHistoryUpdate = millis();
+      LOG_PRINTLN("[History] Skipping push: Telemetry data is stale.");
     }
   }
 
@@ -243,7 +337,7 @@ void loop() {
     lastDiagTime = millis();
     bool isFresh = (millis() - telemetry.lastUpdateTime) < 5000;
     int rxState = digitalRead(RXD2);
-    Serial.printf(
+    LOG_PRINTF(
         "\n[STATUS 115200] Pin %d (RX): %s | Status: %s | Total bytes: %d\n",
         RXD2, rxState ? "HIGH" : "LOW",
         isFresh ? "ONLINE (DATA STREAMING)" : "WAITING FOR 0xFFFF FRAME",
